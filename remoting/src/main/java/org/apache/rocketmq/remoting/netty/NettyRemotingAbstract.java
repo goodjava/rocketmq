@@ -37,15 +37,16 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 
+import io.netty.util.HashedWheelTimer;
+import io.netty.util.Timeout;
+import io.netty.util.Timer;
+import io.netty.util.TimerTask;
 import org.apache.rocketmq.logging.InternalLogger;
 import org.apache.rocketmq.logging.InternalLoggerFactory;
 import org.apache.rocketmq.remoting.ChannelEventListener;
 import org.apache.rocketmq.remoting.InvokeCallback;
 import org.apache.rocketmq.remoting.RPCHook;
-import org.apache.rocketmq.remoting.common.Pair;
-import org.apache.rocketmq.remoting.common.RemotingHelper;
-import org.apache.rocketmq.remoting.common.SemaphoreReleaseOnlyOnce;
-import org.apache.rocketmq.remoting.common.ServiceThread;
+import org.apache.rocketmq.remoting.common.*;
 import org.apache.rocketmq.remoting.exception.RemotingSendRequestException;
 import org.apache.rocketmq.remoting.exception.RemotingTimeoutException;
 import org.apache.rocketmq.remoting.exception.RemotingTooMuchRequestException;
@@ -375,6 +376,55 @@ public abstract class NettyRemotingAbstract {
      */
     public abstract ExecutorService getCallbackExecutor();
 
+
+    public static final Timer TIME_OUT_TIMER = new HashedWheelTimer(
+            new NamedThreadFactory("rocketmq-future-timeout", true),
+            30,
+            TimeUnit.MILLISECONDS);
+
+
+    private void timeoutCheck(int opaque, ResponseFuture future) {
+        this.responseTable.put(opaque, future);
+        TimeoutCheckTask task = new TimeoutCheckTask(future.getOpaque(), this);
+        future.timeoutCheckTask = TIME_OUT_TIMER.newTimeout(task, future.getTimeoutMillis(), TimeUnit.MILLISECONDS);
+    }
+
+
+
+    private static class TimeoutCheckTask implements TimerTask {
+
+        private final int requestID;
+
+        private NettyRemotingAbstract nettyRemoting;
+
+
+        TimeoutCheckTask(int requestID, NettyRemotingAbstract nettyRemoting) {
+            this.requestID = requestID;
+            this.nettyRemoting = nettyRemoting;
+        }
+
+        @Override
+        public void run(Timeout timeout) {
+            ResponseFuture future = nettyRemoting.responseTable.get(requestID);
+            if (future == null) {
+                return;
+            }
+
+            if ((future.getBeginTimestamp() + future.getTimeoutMillis() + 1000) <= System.currentTimeMillis()) {
+                future.release();
+                nettyRemoting.responseTable.remove(requestID);
+                log.warn("remove timeout request, " + future);
+            }
+
+            try {
+                nettyRemoting.executeInvokeCallback(future);
+            } catch (Throwable e) {
+                log.warn("scanResponseTable, operationComplete Exception", e);
+            }
+        }
+
+    }
+
     /**
      * <p>
      * This method is periodically invoked to scan and expire deprecated request.
@@ -404,6 +454,12 @@ public abstract class NettyRemotingAbstract {
         }
     }
 
+
+
+
+
+
+
     public RemotingCommand invokeSyncImpl(final Channel channel, final RemotingCommand request,
         final long timeoutMillis)
         throws InterruptedException, RemotingSendRequestException, RemotingTimeoutException {
@@ -411,7 +467,7 @@ public abstract class NettyRemotingAbstract {
 
         try {
             final ResponseFuture responseFuture = new ResponseFuture(channel, opaque, timeoutMillis, null, null);
-            this.responseTable.put(opaque, responseFuture);
+            timeoutCheck(opaque, responseFuture);
             final SocketAddress addr = channel.remoteAddress();
             channel.writeAndFlush(request).addListener(new ChannelFutureListener() {
                 @Override
@@ -461,7 +517,7 @@ public abstract class NettyRemotingAbstract {
             }
 
             final ResponseFuture responseFuture = new ResponseFuture(channel, opaque, timeoutMillis - costTime, invokeCallback, once);
-            this.responseTable.put(opaque, responseFuture);
+            timeoutCheck(opaque,responseFuture);
             try {
                 channel.writeAndFlush(request).addListener(new ChannelFutureListener() {
                     @Override
